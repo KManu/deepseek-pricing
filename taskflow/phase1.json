@@ -1,0 +1,108 @@
+{
+  "name": "ds-pricing-phase1",
+  "description": "Implement DeepSeek peak/off-peak pricing: rate engine + pi extension + tests, reviewed via gates, then install.",
+  "strictInterpolation": true,
+  "budget": { "maxUSD": 1.5 },
+  "phases": [
+    {
+      "id": "specs-ok",
+      "type": "script",
+      "run": ["bash", "-c", "test -f docs/phase-specs/phase-1.md && test -f docs/research-notes.md && test -f docs/extension-api-cheat.md && echo SPECS-OK"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing"
+    },
+    {
+      "id": "engine",
+      "type": "agent",
+      "agent": "executor",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["specs-ok"],
+      "context": ["docs/phase-specs/phase-1.md", "docs/research-notes.md"],
+      "idempotent": false,
+      "task": "Implement the rate engine exactly per docs/phase-specs/phase-1.md (read it fully): create cn-holidays.json, rates.ts, tests/rates.test.ts in this repo. Follow the spec's exported contracts and test-case list precisely. Use only Node builtins; zero npm deps. After writing, run `node --test tests/` and fix failures until green. Do NOT implement index.ts (later phase)."
+    },
+    {
+      "id": "unit-tests",
+      "type": "script",
+      "run": ["bash", "-c", "node --test tests/ 2>&1 | tail -25"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["engine"]
+    },
+    {
+      "id": "engine-gate",
+      "type": "gate",
+      "agent": "reviewer",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["unit-tests"],
+      "output": "json",
+      "eval": [
+        "{steps.unit-tests.output} contains '# fail 0'",
+        "{steps.unit-tests.output} contains '# pass'"
+      ],
+      "expect": {
+        "type": "object",
+        "properties": {
+          "verdict": { "enum": ["pass", "block"] },
+          "reason": { "type": "string" }
+        },
+        "required": ["verdict", "reason"]
+      },
+      "onBlock": "retry",
+      "retry": { "max": 2 },
+      "task": "Review rates.ts, cn-holidays.json, tests/rates.test.ts on disk against docs/phase-specs/phase-1.md and docs/research-notes.md. Check: rate numbers match the pricing page table exactly, isPeak implements the pure-UTC algorithm, holiday ranges match the official 2026 list, tests cover all listed boundary/holiday/weekend/alias/cost cases, zero deps, no side effects in rates.ts. Respond ONLY with JSON: {\"verdict\":\"pass\"|\"block\",\"reason\":\"...\"}."
+    },
+    {
+      "id": "extension",
+      "type": "agent",
+      "agent": "executor",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["engine-gate"],
+      "context": ["docs/phase-specs/phase-1.md", "docs/extension-api-cheat.md"],
+      "idempotent": false,
+      "task": "Implement index.ts (the pi extension) and install.sh exactly per docs/phase-specs/phase-1.md sections 4-5, using the API facts in docs/extension-api-cheat.md. Zero deps; type-only import of ExtensionAPI. All filesystem IO in try/catch so the extension can never throw into pi. Do not run install.sh."
+    },
+    {
+      "id": "syntax-check",
+      "type": "script",
+      "run": ["bash", "-c", "node --check index.ts && node --check rates.ts && node --check tests/rates.test.ts && bash -n install.sh && echo SYNTAX-OK"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["extension"]
+    },
+    {
+      "id": "ext-gate",
+      "type": "gate",
+      "agent": "reviewer",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["syntax-check"],
+      "output": "json",
+      "eval": ["{steps.syntax-check.output} contains SYNTAX-OK"],
+      "expect": {
+        "type": "object",
+        "properties": {
+          "verdict": { "enum": ["pass", "block"] },
+          "reason": { "type": "string" }
+        },
+        "required": ["verdict", "reason"]
+      },
+      "onBlock": "retry",
+      "retry": { "max": 2 },
+      "task": "Review index.ts and install.sh on disk against docs/phase-specs/phase-1.md and docs/extension-api-cheat.md. Check: message_end only touches assistant deepseek messages and returns {message} with recomputed cost keeping all other fields; tool_result patch guarded by ctx.model deepseek check; agent_settled writes ledger JSONL with try/catch; ds-cost command registered; install.sh idempotent and paths correct. Respond ONLY with JSON: {\"verdict\":\"pass\"|\"block\",\"reason\":\"...\"}."
+    },
+    {
+      "id": "install",
+      "type": "script",
+      "run": ["bash", "install.sh"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["ext-gate"]
+    },
+    {
+      "id": "report",
+      "type": "agent",
+      "agent": "executor",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["install"],
+      "idempotent": false,
+      "final": true,
+      "task": "Phase 1 implementation is complete and installed to ~/.pi/agent/extensions/deepseek-pricing/. Do NOT re-implement anything. 1) Read the files on disk (rates.ts, index.ts, tests, install output above) and write a concise summary: files created, what each does, verification performed. 2) Update PROGRESS.md (create if missing): mark phase-1 implemented+reviewed+installed, and leave phase-1 LIVE-VERIFICATION as pending with exact manual steps. 3) Append the summary to PROGRESS.md."
+    }
+  ]
+}
