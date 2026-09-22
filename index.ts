@@ -23,6 +23,7 @@ import type { Usage } from "./rates.ts";
 const PROVIDER = "deepseek";
 const LEDGER_DIR = join(homedir(), ".pi", "deepseek-pricing");
 const LEDGER_FILE = join(LEDGER_DIR, "ledger.jsonl");
+const COMPACTION_PROBE_FILE = join(LEDGER_DIR, "compaction-probe.jsonl");
 const PEAK_WINDOW_LABEL =
   "01:00\u201304:00 and 06:00\u201310:00 UTC, Mon\u2013Fri (excluding CN public holidays)";
 
@@ -187,6 +188,15 @@ function appendLedger(record: Record<string, unknown>): void {
   }
 }
 
+function appendProbe(record: Record<string, unknown>): void {
+  try {
+    mkdirSync(LEDGER_DIR, { recursive: true });
+    appendFileSync(COMPACTION_PROBE_FILE, `${JSON.stringify(record)}\n`, "utf8");
+  } catch {
+    // Probe evidence IO must never break pi.
+  }
+}
+
 function currentWindow(nowMs: number): { peak: boolean; reason: string } {
   if (isHoliday(nowMs)) return { peak: false, reason: "CN public holiday" };
   const d = new Date(nowMs);
@@ -301,6 +311,85 @@ export default function (pi: ExtensionAPI) {
       });
     } catch {
       // Notification-only event: swallow everything.
+    }
+  });
+
+  // D-09 probe: pi stores the summarization `usage` (with pi's static peak
+  // cost) on the saved compaction entry. Attempt an in-place rewrite of
+  // `usage.cost` and record whether `sessionManager.getEntries()` reflects it,
+  // so the compaction-overestimate decision can be made from evidence.
+  // Evidence-only and fully guarded: it returns nothing actionable.
+  pi.on("session_compact", async (event, ctx) => {
+    try {
+      const entry = event?.compactionEntry as unknown as {
+        id?: unknown;
+        provider?: unknown;
+        model?: unknown;
+        timestamp?: unknown;
+        usage?: unknown;
+      } | null;
+      if (!entry || typeof entry !== "object") return;
+
+      const usage = entry.usage as Record<string, unknown> | null | undefined;
+      if (!usage || typeof usage !== "object") return;
+      if (!usage.cost || typeof usage.cost !== "object") return;
+      const hasTokens = hasNumericTokens(usage);
+      if (!hasTokens) return;
+
+      const ts = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : NaN;
+      if (!Number.isFinite(ts)) return;
+
+      // pi's CompactionEntry carries no provider/model, so prefer any fields
+      // the entry happens to expose and otherwise fall back to the active
+      // model. Never rewrite a non-DeepSeek entry.
+      const provider = typeof entry.provider === "string" ? entry.provider.toLowerCase() : "";
+      const entryModel = typeof entry.model === "string" ? entry.model : "";
+      let modelId = entryModel;
+      let isDeepseek = provider === PROVIDER;
+      if (!provider && entryModel) isDeepseek = modelInfo(entryModel).isDeepseek;
+      if (!provider && !entryModel) {
+        const active = modelInfo(ctx.model);
+        modelId = active.id ?? "";
+        isDeepseek = active.isDeepseek;
+      }
+      if (!isDeepseek) return;
+
+      const recomputed = computeCost(modelId, usage as unknown as Usage, ts);
+      if (!recomputed) return;
+
+      // The probe: mutate the saved entry's cost object in place.
+      (usage as { cost?: unknown }).cost = recomputed;
+      const recomputedTotal = recomputed.total;
+
+      // Re-read persisted entries and locate the same compaction entry.
+      const entries = readEntries(ctx);
+      const found = entries.find((candidate) => {
+        if (!candidate || typeof candidate !== "object") return false;
+        const c = candidate as { type?: unknown; id?: unknown };
+        return c.type === "compaction" && c.id === entry.id;
+      });
+      let objectTotalAfterMutation: number | "not-found" = "not-found";
+      let reflectedInEntries: boolean | "not-found" = "not-found";
+      if (found && typeof found === "object") {
+        const foundTotal = (found as { usage?: { cost?: { total?: unknown } } }).usage?.cost
+          ?.total;
+        if (typeof foundTotal === "number" && Number.isFinite(foundTotal)) {
+          objectTotalAfterMutation = foundTotal;
+          reflectedInEntries = foundTotal === recomputedTotal;
+        }
+      }
+
+      appendProbe({
+        ts: Date.now(),
+        sessionId: sessionIdOf(ctx),
+        model: modelId,
+        recomputedTotal,
+        objectTotalAfterMutation,
+        reflectedInEntries,
+        note: "in-place session_compact usage.cost mutation; reflectedInEntries=true means getEntries() returned the mutated object",
+      });
+    } catch {
+      // Probe is evidence-only: never propagate into pi.
     }
   });
 
