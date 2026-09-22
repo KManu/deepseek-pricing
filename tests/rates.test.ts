@@ -12,6 +12,7 @@ import {
   isPeak,
   rateFor,
   computeCost,
+  computePeakCost,
 } from "../rates.ts";
 
 const at = (iso: string): number => Date.parse(iso);
@@ -188,6 +189,39 @@ test("computeCost: total equals sum of the four buckets", () => {
 });
 
 // --- Sanity invariants -------------------------------------------------------
+
+test("computePeakCost: static peak rates regardless of time", () => {
+  const peak = at("2026-03-02T02:00:00Z");
+  const off = at("2026-03-08T07:00:00Z"); // Sunday, off-peak
+  const usage = { input: 1_000_000, output: 500_000, cacheRead: 2_000_000 };
+  const expected = {
+    input: (1_000_000 * PEAK_RATES["deepseek-v4-pro"].input) / 1e6,
+    output: (500_000 * PEAK_RATES["deepseek-v4-pro"].output) / 1e6,
+    cacheRead: (2_000_000 * PEAK_RATES["deepseek-v4-pro"].cacheRead) / 1e6,
+    cacheWrite: 0,
+  };
+  for (const ts of [peak, off]) {
+    const got = computePeakCost("deepseek-v4-pro", usage)!;
+    closeTo(got.input, expected.input, `input @${ts}`);
+    closeTo(got.output, expected.output, `output @${ts}`);
+    closeTo(got.cacheRead, expected.cacheRead, `cacheRead @${ts}`);
+    closeTo(got.total, expected.input + expected.output + expected.cacheRead, `total @${ts}`);
+  }
+});
+
+test("computePeakCost: equals computeCost during peak, double of off-peak", () => {
+  const peak = at("2026-03-02T02:00:00Z");
+  const off = at("2026-03-02T12:00:00Z"); // same Monday, off-peak hours
+  const usage = { input: 10_000, output: 1_000, cacheRead: 50_000 };
+  const staticCost = computePeakCost("deepseek-flash", usage)!;
+  closeTo(staticCost.total, computeCost("deepseek-flash", usage, peak)!.total);
+  closeTo(staticCost.total, 2 * computeCost("deepseek-flash", usage, off)!.total);
+});
+
+test("computePeakCost: unknown models return null", () => {
+  assert.equal(computePeakCost("gpt-4o", { input: 100 }), null);
+  assert.equal(computePeakCost("deepseek-unknown", { input: 100 }), null);
+});
 
 test("off-peak is exactly half of peak for every bucket/model", () => {
   for (const model of Object.keys(PEAK_RATES)) {

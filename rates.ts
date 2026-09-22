@@ -117,15 +117,10 @@ export function rateFor(modelId: string, utcMs: number): Rates | null {
   return Object.hasOwn(table, key) ? table[key] : null;
 }
 
-/**
- * Cost in USD for a usage record at an instant.
- * `cost.bucket = tokens.bucket * rate.bucket / 1e6`, no rounding.
- * Missing/undefined token fields count as 0.
- * Returns `null` when the model is not a known DeepSeek billing model.
- */
-export function computeCost(modelId: string, usage: Usage, utcMs: number): Cost | null {
-  const rate = rateFor(modelId, utcMs);
-  if (!rate) return null;
+function costAtRates(modelId: string, usage: Usage, table: Record<string, Rates>): Cost | null {
+  const key = normalizeModelId(modelId);
+  if (!key || !Object.hasOwn(table, key)) return null;
+  const rate = table[key]!;
   const u = usage ?? {};
   const input = ((u.input ?? 0) * rate.input) / 1e6;
   const output = ((u.output ?? 0) * rate.output) / 1e6;
@@ -133,4 +128,23 @@ export function computeCost(modelId: string, usage: Usage, utcMs: number): Cost 
   const cacheWrite = ((u.cacheWrite ?? 0) * rate.cacheWrite) / 1e6;
   const total = input + output + cacheRead + cacheWrite;
   return { input, output, cacheRead, cacheWrite, total };
+}
+
+/**
+ * Cost in USD for a usage record at an instant.
+ * `cost.bucket = tokens.bucket * rate.bucket / 1e6`, no rounding.
+ * Missing/undefined token fields count as 0.
+ * Returns `null` when the model is not a known DeepSeek billing model.
+ */
+export function computeCost(modelId: string, usage: Usage, utcMs: number): Cost | null {
+  return costAtRates(modelId, usage, isPeak(utcMs) ? PEAK_RATES : OFFPEAK_RATES);
+}
+
+/**
+ * Static PEAK-rate cost — what pi's built-in catalog would bill regardless of
+ * time of day. Used to quantify what the dynamic pricing corrected
+ * (peak minus dynamic = amount the extension saved).
+ */
+export function computePeakCost(modelId: string, usage: Usage): Cost | null {
+  return costAtRates(modelId, usage, PEAK_RATES);
 }

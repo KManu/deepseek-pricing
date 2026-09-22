@@ -17,7 +17,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { computeCost, isHoliday, isPeak, normalizeModelId } from "./rates.ts";
+import { computeCost, computePeakCost, isHoliday, isPeak, normalizeModelId } from "./rates.ts";
 import type { Usage } from "./rates.ts";
 
 const PROVIDER = "deepseek";
@@ -171,7 +171,11 @@ function summarize(entries: unknown[], activeModel: unknown): Summary {
     bucket.cacheRead += toNumber(usage.cacheRead);
 
     dynamicCost += cost.total;
-    nativeCost += toNumber((usage as { cost?: { total?: unknown } }).cost?.total);
+    // nativeCost = what pi's STATIC peak-rate catalog would have billed for
+    // these same buckets (not the stored, already-patched cost). delta then
+    // measures what the dynamic pricing actually corrected.
+    const peakCost = computePeakCost(modelId ?? "", usage);
+    if (peakCost) nativeCost += peakCost.total;
     count += 1;
     if (!model && modelId) model = modelId;
   }
