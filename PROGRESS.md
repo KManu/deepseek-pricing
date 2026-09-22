@@ -123,6 +123,7 @@ Record the outcome (pass/fail + observed values) in the Phase 1 section above.
 Commits:
 - `33b5a10` feat: phase 2 ds-reconcile balance reconciliation CLI
 - `c8317a5` feat: guarded session_compact cost-probe handler (phase 2 D-09)
+- `70c0ba5` fix: ledger nativeCost = static peak-rate baseline (meaningful delta)
 
 Deliverables on disk:
 - `scripts/ds-reconcile.mjs` — zero-dep Node ESM balance reconciliation CLI
@@ -148,9 +149,13 @@ Deployed:
 | CLI surface | `ds-reconcile --help` | `--once` / `--daemon` / `--stop` / `--help` |
 | Probe handler | grep `session_compact` in `index.ts` | registered, try/catch guarded |
 | Balance history | `wc -l ~/.pi/deepseek-pricing/balance.jsonl` | 3 sample lines |
+| Live balance API | `node scripts/ds-reconcile.mjs --once` | OK: real USD balances, spend $0.01 between samples, drift line printed |
+| Live ledger pipeline | `tail -1 ~/.pi/deepseek-pricing/ledger.jsonl` | line from session `01a0c90d`: stored cost == half-peak == dynamic (proves `message_end` patching end-to-end) |
+| Unit tests after fix | `node --test tests/` | `# pass 19` |
 
-Not yet verified: the live paths — compaction-probe evidence (D-09) and the
-`ds-reconcile` drift line against a real two-sample window. See below.
+Remaining live item: compaction-probe evidence (D-09) — see (a) below.
+(ds-reconcile drift was exercised live; a multi-settled-run drift reading will
+become meaningful as the ledger accumulates lines.)
 
 ### Phase 2 — LIVE VERIFICATION (PENDING)
 
@@ -160,8 +165,9 @@ verification cell `[ ]` until all three are observed and recorded.
 **(a) D-09 compaction probe — decide whether the in-place `usage.cost`
 mutation works** (mutate vs accept overestimate).
 
-1. In a pi session, run `/reload` so the current `index.ts` (with the
-   `session_compact` probe) is hot-loaded.
+1. In a pi session, run `/reload` **again** — the probe handler was added
+   AFTER your earlier reload, so the currently-loaded extension does not have
+   it yet. Confirm it loaded with `/ds-cost` (the command should work).
 2. Run `/compact` to trigger a context compaction. The probe writes one JSON
    line per compaction attempt.
 3. Inspect the evidence:
