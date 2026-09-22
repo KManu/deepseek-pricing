@@ -54,11 +54,14 @@ JSONL lines, append-only, written by the extension on `agent_settled` and by
 add next year's ranges and commit. A missing year makes the engine treat every
 day as non-holiday (fails toward peak rates = conservative, see D-05).
 
-## D-09: Compaction summary cost — deferred to phase 2
-If `session_compact` cannot patch the saved entry's usage (docs show no return),
-pi-generated compaction summaries stay peak-priced. Expected magnitude: a few
-summaries/day at 1M-token scale → cents. Ledger records a `compactionOverestimate`
-flag when detected. Revisit if phase 2 finds a patch path or drift appears.
+## D-09: Compaction summary cost — RESOLVED: mutate (2026-09-22)
+The live `session_compact` probe proved that mutating the saved compaction
+entry's `usage.cost` in place IS reflected by `sessionManager.getEntries()`
+(compaction-probe.jsonl: recomputedTotal == objectTotalAfterMutation,
+reflectedInEntries=true). The extension therefore rewrites the summarization
+cost at the time-aware rate — compaction charges are billed peak/off-peak
+correctly, no overestimate. Every mutation remains audited in
+`~/.pi/deepseek-pricing/compaction-probe.jsonl`.
 
 ## D-10: Context-mode phase is isolated and re-patchable
 Phase 3 edits files inside the context-mode package (build/ + hooks bundle).

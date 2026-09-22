@@ -3,9 +3,16 @@
 //
 // Polls the DeepSeek balance API (ground truth), appends a sample to
 // ~/.pi/deepseek-pricing/balance.jsonl, and compares the balance drop between
-// two samples against the sum of `dynamicCost` in ledger.jsonl for the same
-// window. The difference is the "drift": negative means our time-aware pricing
+// two samples against the NEW usage in ledger.jsonl for the same window.
+// The difference is the "drift": negative means our time-aware pricing
 // under-billed vs the account, positive means it over-billed.
+//
+// Ledger lines are cumulative per session (each settle sums its whole active
+// branch), so reconciliation sums per-session INCREMENTAL deltas: a line's
+// new usage is dynamicCost minus the previous line's dynamicCost of the same
+// session, unless the line starts a new branch (firstTs moved forward after a
+// compaction) — then the whole line is new. Legacy lines without `firstTs`
+// are unattributable and reported as excluded.
 //
 // Facts + formulas: docs/research-notes.md section 7.
 //   GET https://api.deepseek.com/user/balance  (Authorization: Bearer <key>)
@@ -17,15 +24,21 @@
 //
 // Modes:
 //   --once                 one sample (default)
-//   --daemon               sample immediately, then every --interval minutes
+//   --daemon               start a DETACHED sampler (returns immediately);
+//                          sample now, then every --interval minutes
 //   --interval <min>       daemon interval in minutes (float ok, default 60)
 //   --stop                 SIGTERM the daemon recorded in the pidfile
 //   --help                 usage
 //
 // Daemon pidfile: ~/.pi/deepseek-pricing/ds-reconcile.pid (AGENTS.md pattern).
+// The CLI process exits after spawning; the detached child owns the pidfile.
 // SIGTERM/SIGINT remove the pidfile before exit; a live pidfile refuses a
 // second start.
+//
+// Tests (node --test tests/) point DS_PRICING_DIR at a fixture directory;
+// ledgerWindowSum is exported for that purpose.
 
+import { spawn } from "node:child_process";
 import {
   appendFileSync,
   mkdirSync,
@@ -35,8 +48,9 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const DATA_DIR = join(homedir(), ".pi", "deepseek-pricing");
+const DATA_DIR = process.env.DS_PRICING_DIR || join(homedir(), ".pi", "deepseek-pricing");
 const BALANCE_FILE = join(DATA_DIR, "balance.jsonl");
 const LEDGER_FILE = join(DATA_DIR, "ledger.jsonl");
 const PID_FILE = join(DATA_DIR, "ds-reconcile.pid");
@@ -204,20 +218,43 @@ function appendSample(sample) {
 // --- ledger window -----------------------------------------------------------
 
 /**
- * Sum `dynamicCost` over ledger lines in the half-open window
- * (sinceTs, untilTs]. Exclusive start avoids double-counting a line that sits
- * exactly on a previous sample boundary.
+ * New-usage value a ledger line represents inside the window, or `null` when
+ * the line cannot be attributed (legacy/partial coverage).
+ *
+ * - first line of a session: counted fully only when its whole branch started
+ *   inside the window (firstTs > sinceTs); otherwise partial -> null.
+ * - same branch as the previous line (equal firstTs): delta vs the previous
+ *   cumulative cost. Settle granularity: entries between settles are attributed
+ *   to the settle line even when some predate the window start.
+ * - new branch (firstTs moved forward, compaction reset): the line is all new
+ *   usage (the compaction entry cost plus fresh entries) -> full cost.
+ * - legacy lines or legacy-preceded lines: null.
  */
-function ledgerWindowSum(sinceTs, untilTs) {
+function incrementalFor(line, prev, sinceTs) {
+  if (line.sessionId === "" || line.firstTs === null) return null;
+  if (!prev) {
+    return line.firstTs > sinceTs ? line.cost : null;
+  }
+  if (prev.firstTs === null) return null;
+  if (line.firstTs === prev.firstTs) return Math.max(0, line.cost - prev.cost);
+  if (line.firstTs > prev.firstTs) return line.cost;
+  return null;
+}
+
+/**
+ * Sum NEW usage over ledger lines in the half-open window (sinceTs, untilTs].
+ * Lines are cumulative per session, so incremental values are computed per
+ * session (see incrementalFor). Returns { sum, count, excluded, present }.
+ */
+export function ledgerWindowSum(sinceTs, untilTs) {
   let raw;
   try {
     raw = readFileSync(LEDGER_FILE, "utf8");
   } catch {
-    return { sum: 0, count: 0, present: false };
+    return { sum: 0, count: 0, excluded: 0, present: false };
   }
 
-  let sum = 0;
-  let count = 0;
+  const lines = [];
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -237,12 +274,42 @@ function ledgerWindowSum(sinceTs, untilTs) {
     ) {
       continue;
     }
-    if (ts > sinceTs && ts <= untilTs) {
-      sum += cost;
-      count += 1;
-    }
+    const firstTs = rec?.firstTs;
+    lines.push({
+      ts,
+      cost,
+      sessionId: typeof rec.sessionId === "string" ? rec.sessionId : "",
+      firstTs:
+        typeof firstTs === "number" && Number.isFinite(firstTs)
+          ? firstTs
+          : null,
+    });
   }
-  return { sum, count, present: true };
+  lines.sort((a, b) => a.ts - b.ts);
+
+  let sum = 0;
+  let count = 0;
+  let excluded = 0;
+  for (const line of lines) {
+    if (line.ts <= sinceTs || line.ts > untilTs) continue;
+    let prev = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const candidate = lines[i];
+      if (candidate.ts >= line.ts) continue;
+      if (candidate.sessionId !== "" && candidate.sessionId === line.sessionId) {
+        prev = candidate;
+        break;
+      }
+    }
+    const incremental = incrementalFor(line, prev, sinceTs);
+    if (incremental === null) {
+      excluded += 1;
+      continue;
+    }
+    sum += incremental;
+    count += 1;
+  }
+  return { sum, count, excluded, present: true };
 }
 
 // --- report ------------------------------------------------------------------
@@ -287,7 +354,7 @@ function printReport(prev, curr) {
     `  balance spend: ${usd(balanceSpend)} ${curr.currency} (top-up detected: ${usd(topUp)})`,
   );
   out.push(
-    `  ledger window sum: ${usd(window.sum)} USD (${window.count} run(s)${window.present ? "" : ", ledger absent"})`,
+    `  ledger window sum: ${usd(window.sum)} USD (${window.count} new-use line(s)${window.excluded ? `, ${window.excluded} excluded (legacy/partial coverage)` : ""}${window.present ? "" : ", ledger absent"})`,
   );
 
   // The ledger is USD-only; a non-USD balance cannot be compared meaningfully.
@@ -303,6 +370,11 @@ function printReport(prev, curr) {
           ? "positive: ledger over-billed vs the balance drop"
           : "zero: ledger matched the balance drop";
     out.push(`  drift: ${usd(drift)} USD (${note})`);
+    if (curr.ts - prev.ts < 3 * 3600_000) {
+      out.push(
+        "  note: short window — balance billing and settle lines can lag usage; long windows are authoritative",
+      );
+    }
   }
 
   process.stdout.write(out.join("\n") + "\n");
@@ -408,6 +480,24 @@ async function runDaemon(intervalMin) {
   }, intervalMin * 60_000);
 }
 
+/** Spawn a detached sampler child and return immediately (no pidfile race). */
+function startDaemonChild(intervalMin) {
+  const child = spawn(
+    process.execPath,
+    [
+      fileURLToPath(import.meta.url),
+      "--daemon-child",
+      "--interval",
+      String(intervalMin),
+    ],
+    { detached: true, stdio: "ignore" },
+  );
+  child.unref();
+  process.stdout.write(
+    `ds-reconcile daemon: started detached (pid ${child.pid}, interval ${intervalMin} min)\n`,
+  );
+}
+
 function stopDaemon() {
   const pid = readPidFile();
   if (!pid || !isAlive(pid)) {
@@ -457,6 +547,8 @@ function parseArgs(argv) {
       opts.mode = "once";
     } else if (arg === "--daemon") {
       opts.mode = "daemon";
+    } else if (arg === "--daemon-child") {
+      opts.mode = "daemon-child"; // internal: detached child loop
     } else if (arg === "--stop") {
       opts.mode = "stop";
     } else if (arg === "--help" || arg === "-h") {
@@ -482,8 +574,9 @@ function printHelp() {
       "Usage:",
       "  ds-reconcile [--once]              sample balance once (default)",
       "  ds-reconcile --daemon [--interval <min>]",
-      "                                     sample immediately, then every <min> minutes",
-      "                                     (float allowed; default 60)",
+      "                                     start a detached sampler (returns",
+      "                                     immediately); sample now, then every",
+      "                                     <min> minutes (float allowed; default 60)",
       "  ds-reconcile --stop                stop the daemon in the pidfile",
       "  ds-reconcile --help                show this help",
       "",
@@ -510,13 +603,26 @@ async function main() {
     return;
   }
   if (opts.mode === "daemon") {
+    const existing = readPidFile();
+    if (existing && isAlive(existing)) {
+      fail(`daemon already running (pid ${existing}); stop it with --stop`);
+    }
+    startDaemonChild(opts.interval);
+    return;
+  }
+  if (opts.mode === "daemon-child") {
+    // Detached child: never returns; the interval keeps the event loop alive.
     await runDaemon(opts.interval);
     return;
   }
   await sampleOnce();
 }
 
-main().catch((err) => {
-  process.stderr.write(`ds-reconcile: ${err?.message ?? err}\n`);
-  process.exit(1);
-});
+const isMain =
+  process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+if (isMain) {
+  main().catch((err) => {
+    process.stderr.write(`ds-reconcile: ${err?.message ?? err}\n`);
+    process.exit(1);
+  });
+}

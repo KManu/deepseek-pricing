@@ -12,7 +12,7 @@ Runtime deploy: `~/.pi/agent/extensions/deepseek-pricing/`
 | Phase | Build | Review | Installed | Live verification |
 |---|---|---|---|---|
 | Phase 1 — rate engine + extension | `[x]` | `[x]` | `[x]` | `[x]` (2026-09-22, user-confirmed) |
-| Phase 2 — reconciliation + ops | `[x]` | `[x]` | `[x]` | `[ ]` |
+| Phase 2 — reconciliation + ops | `[x]` | `[x]` | `[x]` | `[x]` (2026-09-22, live probe + CLI + daemon) |
 | Phase 3 — context-mode stats (optional) | `[ ]` | `[ ]` | `[ ]` | `[ ]` |
 
 ---
@@ -124,6 +124,9 @@ Commits:
 - `33b5a10` feat: phase 2 ds-reconcile balance reconciliation CLI
 - `c8317a5` feat: guarded session_compact cost-probe handler (phase 2 D-09)
 - `70c0ba5` fix: ledger nativeCost = static peak-rate baseline (meaningful delta)
+- `bcffd33` docs: phase 2 live evidence recorded
+- `??` fix: detached daemon + per-session incremental reconciliation (firstTs)
+  + D-09 resolution (see git log for hash; committed 2026-09-22)
 
 Deliverables on disk:
 - `scripts/ds-reconcile.mjs` — zero-dep Node ESM balance reconciliation CLI
@@ -151,67 +154,57 @@ Deployed:
 | Balance history | `wc -l ~/.pi/deepseek-pricing/balance.jsonl` | 3 sample lines |
 | Live balance API | `node scripts/ds-reconcile.mjs --once` | OK: real USD balances, spend $0.01 between samples, drift line printed |
 | Live ledger pipeline | `tail -1 ~/.pi/deepseek-pricing/ledger.jsonl` | line from session `01a0c90d`: stored cost == half-peak == dynamic (proves `message_end` patching end-to-end) |
-| Unit tests after fix | `node --test tests/` | `# pass 19` |
+| Unit tests after fix | `node --test tests/rates.test.ts tests/ds-reconcile.test.mjs` | `# pass 24` |
 
-Remaining live item: compaction-probe evidence (D-09) — see (a) below.
-(ds-reconcile drift was exercised live; a multi-settled-run drift reading will
-become meaningful as the ledger accumulates lines.)
+### Phase 2 — LIVE VERIFICATION (DONE, 2026-09-22)
 
-### Phase 2 — LIVE VERIFICATION (PENDING)
+**(a) D-09 compaction probe — RESOLVED: mutate.**
 
-Manual steps, run in a real pi session / shell. Leave the Phase 2 Live
-verification cell `[ ]` until all three are observed and recorded.
+Live probe line (session `01a0c8a2`, `/compact` at 13:38Z):
 
-**(a) D-09 compaction probe — decide whether the in-place `usage.cost`
-mutation works** (mutate vs accept overestimate).
-
-1. In a pi session, run `/reload` **again** — the probe handler was added
-   AFTER your earlier reload, so the currently-loaded extension does not have
-   it yet. Confirm it loaded with `/ds-cost` (the command should work).
-2. Run `/compact` to trigger a context compaction. The probe writes one JSON
-   line per compaction attempt.
-3. Inspect the evidence:
-   ```bash
-   cat ~/.pi/deepseek-pricing/compaction-probe.jsonl
-   ```
-4. **Decision:**
-   - If lines show `"reflectedInEntries": true`, the in-place mutation works
-     and pi keeps the time-aware summary cost → keep the mutation
-     (**D-09 = mutate**).
-   - If lines show `"reflectedInEntries": false` or `"not-found"`, pi does not
-     re-read the mutated object → accept pi's static peak-cost overestimate for
-     the summarization charge (**D-09 = accept overestimate**) and retire the
-     mutation.
-
-**(b) `ds-reconcile` drift line** (needs ≥ 2 balance samples spanning at least
-one settled ledger run).
-
-1. Run a normal pi session against a DeepSeek model until it settles, so a
-   `ledger.jsonl` line is written.
-2. Run the CLI:
-   ```bash
-   ds-reconcile
-   ```
-3. Check the report's last line:
-   ```
-   drift: <value> USD (negative: ledger under-billed vs the balance drop |
-   positive: ledger over-billed | zero: ledger matched)
-   ```
-   A small signed drift is expected (rounding, non-billed requests); a large
-   systematic drift means the rate engine or the ledger window is wrong.
-   Record the observed value in the Phase 2 summary below.
-
-**(c) Optional — long-run daemon.**
-
-```bash
-nohup ds-reconcile --daemon --interval 60 >/dev/null 2>&1 &   # background sampler
-# ... let it run across several samples ...
-ds-reconcile --stop                                            # SIGTERM + pidfile cleanup
+```json
+{"ts":1790084330171,"sessionId":"01a0c8a2-...","model":"deepseek-v4-pro",
+ "recomputedTotal":0.09109914,"objectTotalAfterMutation":0.09109914,
+ "reflectedInEntries":true,"note":"in-place session_compact usage.cost mutation..."}
 ```
 
-Confirm `~/.pi/deepseek-pricing/ds-reconcile.pid` appears, the daemon keeps
-appending to `balance.jsonl`, `--stop` removes the pidfile, and a second
-`--daemon` start is refused while one is live.
+`recomputedTotal == objectTotalAfterMutation` and `reflectedInEntries=true`:
+pi persists the mutated cost → compaction summaries are billed at the
+time-aware rate. The handler is now the production correction (comment
+updated in `index.ts`); every mutation stays audited in
+`~/.pi/deepseek-pricing/compaction-probe.jsonl`. **D-09 = mutate.**
+
+**(b) `ds-reconcile` drift line — verified, and two real bugs fixed.**
+
+Live `--once` runs hit the balance API (real USD balances) and printed the
+drift line. The first live drift reading exposed two defects, both fixed and
+re-verified:
+
+1. **Cumulative-line double counting**: ledger lines are cumulative per
+   session, so summing raw `dynamicCost` over a window double-counted
+   (+$1.73 ghost drift on first run). Fixed: per-session incremental deltas
+   via a new `firstTs` field (branch start) on each ledger line; legacy
+   lines without `firstTs` are reported as excluded. Covered by 5 new unit
+   tests (`tests/ds-reconcile.test.mjs`).
+2. **`--daemon` never detached**: the interval loop kept the foreground
+   process alive (CLI never returned). Fixed: `--daemon` spawns a detached
+   child (`--daemon-child`, internal) and returns in ~0.2s; the child owns
+   the pidfile.
+
+**(c) Daemon lifecycle — verified.**
+
+```
+ds-reconcile --daemon --interval 1   # returns immediately; detached sampler (pid N)
+ds-reconcile --once                  # sample now; drift + short-window note
+ds-reconcile --stop                  # SIGTERM; "stopped (pid N)"
+```
+
+Observed: pidfile appears, sample appended, `--stop` kills the detached
+child and removes the pidfile, and a live pidfile refuses a second start.
+
+Final test count: `node --test tests/rates.test.ts tests/ds-reconcile.test.mjs`
+→ **24 tests, 24 pass, 0 fail**. (`node --test tests/` alone does not pick up
+`.mjs` on this Node version — pass both files explicitly.)
 
 ## Phase 3 — context-mode stats accuracy (optional)
 

@@ -42,6 +42,8 @@ interface Summary {
   nativeCost: number;
   count: number;
   model: string | null;
+  /** Earliest entry timestamp counted in the active branch, or null. */
+  firstTs: number | null;
 }
 
 // --- small helpers -----------------------------------------------------------
@@ -130,6 +132,7 @@ function summarize(entries: unknown[], activeModel: unknown): Summary {
   let nativeCost = 0;
   let count = 0;
   let model: string | null = active.id;
+  let firstTs: number | null = null;
 
   for (const entry of entries) {
     if (!entry || typeof entry !== "object") continue;
@@ -178,9 +181,10 @@ function summarize(entries: unknown[], activeModel: unknown): Summary {
     if (peakCost) nativeCost += peakCost.total;
     count += 1;
     if (!model && modelId) model = modelId;
+    if (Number.isFinite(ts)) firstTs = firstTs === null ? ts : Math.min(firstTs, ts);
   }
 
-  return { peakTokens, offPeakTokens, dynamicCost, nativeCost, count, model };
+  return { peakTokens, offPeakTokens, dynamicCost, nativeCost, count, model, firstTs };
 }
 
 function appendLedger(record: Record<string, unknown>): void {
@@ -303,6 +307,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     try {
       const summary = summarize(readEntries(ctx), ctx.model);
+      if (summary.count === 0) return; // nothing DeepSeek-billed settled: no line
       appendLedger({
         ts: Date.now(),
         sessionId: sessionIdOf(ctx),
@@ -312,17 +317,19 @@ export default function (pi: ExtensionAPI) {
         dynamicCost: summary.dynamicCost,
         nativeCost: summary.nativeCost,
         delta: summary.dynamicCost - summary.nativeCost,
+        firstTs: summary.firstTs,
       });
     } catch {
       // Notification-only event: swallow everything.
     }
   });
 
-  // D-09 probe: pi stores the summarization `usage` (with pi's static peak
-  // cost) on the saved compaction entry. Attempt an in-place rewrite of
-  // `usage.cost` and record whether `sessionManager.getEntries()` reflects it,
-  // so the compaction-overestimate decision can be made from evidence.
-  // Evidence-only and fully guarded: it returns nothing actionable.
+  // D-09 (RESOLVED 2026-09-22, live evidence): pi stores the summarization
+  // `usage` (with pi's static peak cost) on the saved compaction entry.
+  // Rewrite `usage.cost` in place with the time-aware cost; the probe
+  // experiment proved `sessionManager.getEntries()` reflects the mutation
+  // (compaction-probe.jsonl: reflectedInEntries=true), so pi persists the
+  // corrected cost. Every line appended here doubles as an audit record.
   pi.on("session_compact", async (event, ctx) => {
     try {
       const entry = event?.compactionEntry as unknown as {

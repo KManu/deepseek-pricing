@@ -132,3 +132,27 @@ starts 2026-07-27, so 2026 coverage suffices for back-calculation.
 - Top-up detection between samples: `topUp = max(0, currToppedUp - prevToppedUp)`;
   `balanceSpend = prevTotal - currTotal + topUp`; `drift = ledgerWindowSum - balanceSpend`.
 - Key source: `~/.pi/agent/auth.json` → `deepseek.key` (file mode 0600; never log it).
+
+### 7.1 Live calibration findings (2026-09-22, ds-reconcile v2)
+
+- **Ledger lines are cumulative per session** (each settle sums the whole
+  active branch). Naively summing lines in a window double-counts. Fixed:
+  reconciliation sums per-session incremental deltas (`dynamicCost` minus the
+  previous line of the same session) and detects compaction resets via a
+  `firstTs` field (earliest entry timestamp of the branch) added to each
+  ledger line. Legacy lines without `firstTs` are reported as excluded.
+- **Settle-granularity approximation**: entries between two settles are
+  attributed to the later settle's line even when some predate the window
+  start. Settles are per-turn (minutes), so this is small.
+- **Compaction charges appear in the ledger at the NEXT settle** (the
+  compaction entry joins the branch after the compaction event), while the
+  balance drop reflects them sooner. Short windows show drift for this reason
+  alone; the CLI prints a short-window note (< 3h). Long windows are
+  authoritative.
+- **Balance billing vs usage timing**: observed balance drops consistent with
+  usage within ~minutes (e.g. a $0.15 drop in a window containing a $0.09
+  compaction call plus turns), i.e. no evidence of long billing lag, but
+  sample spacing dominates precision.
+- **First live D-09 evidence** (session 01a0c8a2, compaction at 13:38Z):
+  in-place mutation of the compaction entry's `usage.cost` is reflected by
+  `sessionManager.getEntries()` → compaction charges are time-corrected.
