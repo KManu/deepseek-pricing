@@ -125,7 +125,7 @@ Commits:
 - `c8317a5` feat: guarded session_compact cost-probe handler (phase 2 D-09)
 - `70c0ba5` fix: ledger nativeCost = static peak-rate baseline (meaningful delta)
 - `bcffd33` docs: phase 2 live evidence recorded
-- `??` fix: detached daemon + per-session incremental reconciliation (firstTs)
+- `1adeed5` fix: detached daemon + per-session incremental reconciliation (firstTs)
   + D-09 resolution (see git log for hash; committed 2026-09-22)
 
 Deliverables on disk:
