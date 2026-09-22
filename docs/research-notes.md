@@ -114,6 +114,25 @@ starts 2026-07-27, so 2026 coverage suffices for back-calculation.
   — both files must be patched together for phase 3, and re-patched after
   every context-mode upgrade (same class of caveat as the pi-shazam fix).
 
+### 5.1 Verified facts (2026-09-22, installed package)
+
+- **The bundle is minified** (`hooks/session-extract.bundle.mjs`, 3 lines) with
+the price catalog inlined as a single `var O={...}` object literal. Patching a
+single expression inside it has no stable anchor across releases → left
+unpatched (decisions.md D-11).
+- **Its cost function prefers a numeric `native_cost_usd`.** `build/session/extract.js`
+(as bundled) maps pi's `usage.cost.total` → `native_cost_usd`
+("Pi-native USD cost lives on `usage.cost.total`. Preserve it only when finite"),
+which phases 1–2 already rewrite to the time-aware value. Catalog lookup is the
+fallback for rows without a native cost.
+- **`build/session/pricing.js` is unminified** (242 lines, JSDoc + named
+`export function`s) and therefore importable directly in tests — the phase-3
+test suite and `scripts/patch-ctxmode.sh verify` both do exactly that.
+- **Probe result** (`docs/evidence/phase3-native-pass.json`, source `bundle`):
+161 usage rows, 160 DeepSeek, 160 with numeric `native_cost_usd`,
+`catalogFallbackRows` = 0, `nativeCostUsdSum` = $1.93768124. No observed
+DeepSeek row needed the catalog fallback.
+
 ## 6. Ground truth for reconciliation
 
 - `GET https://api.deepseek.com/user/balance` with the DeepSeek API key

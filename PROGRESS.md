@@ -13,7 +13,7 @@ Runtime deploy: `~/.pi/agent/extensions/deepseek-pricing/`
 |---|---|---|---|---|
 | Phase 1 — rate engine + extension | `[x]` | `[x]` | `[x]` | `[x]` (2026-09-22, user-confirmed) |
 | Phase 2 — reconciliation + ops | `[x]` | `[x]` | `[x]` | `[x]` (2026-09-22, live probe + CLI + daemon) |
-| Phase 3 — context-mode stats (optional) | `[ ]` | `[ ]` | `[ ]` | `[ ]` |
+| Phase 3 — context-mode stats (optional) | `[x]` | `[x]` | `[x]` | `[ ]` |
 
 ---
 
@@ -208,10 +208,53 @@ Final test count: `node --test tests/rates.test.ts tests/ds-reconcile.test.mjs`
 
 ## Phase 3 — context-mode stats accuracy (optional)
 
-**Implemented:** `[ ]`
+**Implemented:** `[x]` (2026-09-22) · **Reviewed:** `[x]` · **Installed:** `[x]`
 
-Patch context-mode's `pricing.js` + inlined hook bundle so `ctx_stats` reports
-time-aware DeepSeek cost (see `PLAN.md` / `docs/phase-specs/phase-3.md`).
+Commits:
+- `f5c7324` taskflow: phase 3 flow (pricing.js patch + native pass-through strategy)
+- `2dcf114` phase 3: stage patched context-mode pricing.js (time-aware DeepSeek peak/off-peak)
+- `8e16264` phase 3: ctxmode-pricing test suite + pristine fixture
+- `e1af00b` phase 3: patch-ctxmode.sh + native-pass probe
+
+Deliverables on disk:
+- `stage/context-mode/build/session/pricing.js` — patched, time-aware module
+- `stage/context-mode-pristine/` — pristine fixture for diffing
+- `scripts/patch-ctxmode.sh` — installer (`apply` / `check` / `verify`)
+- `scripts/probe-native-pass.mjs` — evidence probe over a real session
+- `docs/evidence/phase3-native-pass.json` — probe output
+
+Approach (decisions.md D-11): only the unminified `pricing.js` is patched; the
+minified `hooks/session-extract.bundle.mjs` is left alone because its cost
+function already prefers numeric `native_cost_usd` (mapped from pi's
+`usage.cost.total` by `build/session/extract.js`), which phases 1–2 already make
+time-aware.
+
+**Evidence (2026-09-22T14:23:49Z, source `bundle`, session `01a0c8a2`):**
+161 usage rows, 160 DeepSeek, **160/160 with numeric `native_cost_usd`**,
+`catalogFallbackRows` = 0, `nativeCostUsdSum` = $1.93768124.
+
+### Phase 3 — LIVE VERIFICATION (`[ ]` OPEN)
+
+Two manual steps, both user-run:
+
+1. **Compare ctx_stats to the ledger on a real session.**
+   Run `ctx_stats` (or `/context-mode:ctx-stats`) in a live pi session and
+   compare its DeepSeek rows against the extension ledger:
+   ```bash
+   cat ~/.pi/deepseek-pricing/ledger.jsonl
+   ```
+   **Pass:** the DeepSeek cost rows agree with the ledger's `dynamicCost` for
+   the same session (off-peak turns ≈ half the static peak rate).
+
+2. **Re-apply after upgrades.** After any context-mode upgrade (`ctx-upgrade` or
+   an npm update) run:
+   ```bash
+   bash scripts/patch-ctxmode.sh apply
+   ```
+   Per the documented idempotence convention, `apply` exits **1** with
+   `ALREADY PATCHED` when the installed file already matches staged — that is
+   success, not failure; callers must inspect the exit code. Exit 0 = a fresh
+   patch was applied. `check` / `verify` are read-only counterparts.
 
 ---
 

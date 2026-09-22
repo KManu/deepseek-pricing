@@ -67,3 +67,27 @@ correctly, no overestimate. Every mutation remains audited in
 Phase 3 edits files inside the context-mode package (build/ + hooks bundle).
 Those edits do NOT survive context-mode upgrades; we keep a patch script in this
 repo and re-run it after upgrades (same policy as the pi-shazam log-path fix).
+
+## D-11: context-mode bundle left unpatched
+We patch only the unminified module `build/session/pricing.js`; the hook bundle
+`hooks/session-extract.bundle.mjs` is left untouched.
+
+Why: the bundle is a 3-line minified artifact with the price catalog inlined as
+`var O={...}`. A surgical rewrite of one expression inside it has no stable
+anchor (minifiers rename/mangle across releases), so the patch would be fragile
+and silently wrong after any upgrade — worse than not patching. The bundle does
+not need it: its cost function already prefers a numeric `native_cost_usd`, which
+`build/session/extract.js` maps from pi's `usage.cost.total` — and phases 1–2
+patch that value at the source, so the common DeepSeek rows are time-aware
+without touching the bundle.
+
+Evidence (`docs/evidence/phase3-native-pass.json`, probe 2026-09-22T14:23:49Z,
+source `bundle`): of 161 usage rows, 160 DeepSeek rows ALL had numeric
+`native_cost_usd` (catalogFallbackRows = 0), summing $1.93768124. Zero rows fell
+back to the inlined catalog, i.e. the unpatched bundle path already carries every
+observed DeepSeek row. `pricing.js` is patched anyway as the fallback that the
+static map is used for rows without a native cost.
+
+Change if: the probe ever reports catalogFallbackRows > 0 for DeepSeek rows
+(e.g. a pi change stops setting `usage.cost.total`), or context-mode stops
+preferring `native_cost_usd`.
