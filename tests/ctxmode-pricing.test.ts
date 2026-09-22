@@ -15,7 +15,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -193,8 +193,32 @@ const installedPresent =
   existsSync(join(INSTALLED_DIR, "pricing.js")) &&
   existsSync(join(INSTALLED_DIR, "model-prices.json"));
 
+/**
+ * Newest phase-3 pre-patch backup in the installed session dir, or null.
+ * scripts/patch-ctxmode.sh writes pricing.js.pre-ds-pricing.<epoch>.bak
+ * immediately before overwriting the installed module, so once the patch has
+ * been applied this backup — not the patched live file — is the unmodified
+ * reference the pristine fixture must match.
+ */
+function newestInstalledBackup(dir: string): string | null {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  let best: { path: string; epoch: number } | null = null;
+  for (const name of names) {
+    const match = /^pricing\.js\.pre-ds-pricing\.(\d+)\.bak$/.exec(name);
+    if (!match) continue;
+    const epoch = Number(match[1]);
+    if (!best || epoch > best.epoch) best = { path: join(dir, name), epoch };
+  }
+  return best ? best.path : null;
+}
+
 test(
-  "pristine fixture is an unmodified copy of the installed module",
+  "pristine fixture matches the unmodified (pre-patch) installed module",
   {
     skip: installedPresent
       ? false
@@ -202,12 +226,20 @@ test(
   },
   () => {
     const fixtureDir = new URL("../stage/context-mode-pristine/", import.meta.url);
+    const backup = newestInstalledBackup(INSTALLED_DIR);
     for (const file of ["pricing.js", "model-prices.json"]) {
-      const installed = readFileSync(join(INSTALLED_DIR, file));
+      // pricing.js: compare against the newest pre-patch backup once the patch
+      // has been applied, otherwise against the still-unmodified installed file.
+      // model-prices.json is never patched, so it always compares to installed.
+      const referencePath =
+        file === "pricing.js" && backup ? backup : join(INSTALLED_DIR, file);
+      const reference = readFileSync(referencePath);
       const fixture = readFileSync(new URL(file, fixtureDir));
       assert.ok(
-        installed.equals(fixture),
-        `stage/context-mode-pristine/${file} differs from the installed file`,
+        reference.equals(fixture),
+        `stage/context-mode-pristine/${file} differs from ${
+          file === "pricing.js" && backup ? backup : "the installed file"
+        }`,
       );
     }
   },
