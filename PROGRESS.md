@@ -13,7 +13,7 @@ Runtime deploy: `~/.pi/agent/extensions/deepseek-pricing/`
 |---|---|---|---|---|
 | Phase 1 — rate engine + extension | `[x]` | `[x]` | `[x]` | `[x]` (2026-09-22, user-confirmed) |
 | Phase 2 — reconciliation + ops | `[x]` | `[x]` | `[x]` | `[x]` (2026-09-22, live probe + CLI + daemon) |
-| Phase 3 — context-mode stats (optional) | `[x]` | `[x]` | `[x]` | `[ ]` |
+| Phase 3 — context-mode stats (optional) | `[x]` | `[x]` | `[x]` | `[x]` (2026-09-22, bundle probe on live session) |
 
 ---
 
@@ -209,6 +209,10 @@ Final test count: `node --test tests/rates.test.ts tests/ds-reconcile.test.mjs`
 ## Phase 3 — context-mode stats accuracy (optional)
 
 **Implemented:** `[x]` (2026-09-22) · **Reviewed:** `[x]` · **Installed:** `[x]`
+· **Live-verified:** `[x]` (2026-09-22) — the installed hook bundle was run
+over this session's real file: 160/160 DeepSeek rows took the native-cost
+pass-through (0 catalog fallbacks, sum $1.9377), matching the ledger's
+time-aware totals (~$1.12 dynamic for the post-compaction branch).
 
 Commits:
 - `f5c7324` taskflow: phase 3 flow (pricing.js patch + native pass-through strategy)
