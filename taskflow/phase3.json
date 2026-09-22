@@ -1,0 +1,149 @@
+{
+  "name": "ds-pricing-phase3",
+  "description": "Phase 3: context-mode time-aware DeepSeek pricing — patch the unminified pricing.js fallback (staged + idempotent patch script), prove native-cost pass-through, skip the fragile minified-bundle patch.",
+  "strictInterpolation": true,
+  "budget": { "maxUSD": 1.5 },
+  "phases": [
+    {
+      "id": "specs-ok",
+      "type": "agent",
+      "agent": "planner",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "context": ["docs/phase-specs/phase-3.md", "docs/research-notes.md", "docs/decisions.md"],
+      "idempotent": false,
+      "task": "Verify the phase-3 v2 strategy against the REAL installed files and lock the spec. Read docs/phase-specs/phase-3.md fully, then inspect: (1) ~/.pi/agent/npm/node_modules/context-mode/build/session/pricing.js — confirm it is UNMINIFIED ESM, imports ./model-prices.json `with { type: \"json\" }`, exports lookupPrice(modelId), computeCostUsd(modelId, t), nativeOrComputed(modelId, t, native); (2) ~/.pi/agent/npm/node_modules/context-mode/build/session/extract.js — confirm pi session extraction reads usage.cost.total into native_cost_usd (search 'native_cost_usd'); (3) ~/.pi/agent/npm/node_modules/context-mode/hooks/session-extract.bundle.mjs — confirm it is MINIFIED (a few very long lines, catalog inlined as `var O={...}`) and its cost function prefers a numeric native_cost_usd before computing from the catalog (search 'native_cost_usd' and 'cost_usd'). STRATEGY v2 (already decided, verify feasibility only): patch ONLY pricing.js with a time-aware DeepSeek override (computeCostUsd gains an optional third param tsMs; deepseek ids get peak/off-peak rates from a self-contained inline pure-UTC engine + 2026 CN holiday table; no ts => static peak = backward compatible); do NOT patch the minified bundle (native-cost pass-through from phases 1-2 already makes the common rows time-aware); prove the pass-through with a probe script. Report: whether each of the 3 facts holds, any surprises (e.g. bundle export shape for importing), and a final VERDICT line: `VERDICT: PASS` or `VERDICT: BLOCK <reason>`."
+    },
+    {
+      "id": "specs-gate",
+      "type": "gate",
+      "agent": "reviewer",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["specs-ok"],
+      "output": "json",
+      "eval": ["{steps.specs-ok.output} contains 'VERDICT: PASS'"],
+      "expect": {
+        "type": "object",
+        "properties": {
+          "verdict": { "enum": ["pass", "block"] },
+          "reason": { "type": "string" }
+        },
+        "required": ["verdict", "reason"]
+      },
+      "onBlock": "retry",
+      "retry": { "max": 1 },
+      "task": "Check whether the specs-ok phase verified all three facts and concluded VERDICT: PASS. If it did, verdict pass. If it blocked for a fixable reason (e.g. a wrong assumption about file shapes), describe the fix in the reason. Respond ONLY with JSON: {\"verdict\":\"pass\"|\"block\",\"reason\":\"...\"}."
+    },
+    {
+      "id": "impl-pricing",
+      "type": "agent",
+      "agent": "executor-code",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["specs-gate"],
+      "context": ["docs/phase-specs/phase-3.md", "docs/phase-specs/phase-1.md", "rates.ts", "cn-holidays.json"],
+      "idempotent": false,
+      "task": "Create stage/context-mode/build/session/pricing.js: a PATCHED COPY of the installed ~/.pi/agent/npm/node_modules/context-mode/build/session/pricing.js (read it first; keep every existing export and behavior byte-for-byte unless specified). Changes: (1) computeCostUsd(modelId, t, tsMs?) — after lookupPrice resolves, if the resolved id (normalize: lowercase, strip one leading provider/ prefix, map legacy alias deepseek-v4-flash -> deepseek-flash) is one of deepseek-flash / deepseek-v4-pro, compute with time-aware rates instead of the catalog row: pure-UTC peak windows Mon-Fri [01:00,04:00) and [06:00,10:00) UTC, off-peak = exactly half of peak for every bucket; CN holiday days are off-peak all day; when tsMs is absent/NaN use the STATIC PEAK rates (backward compatible — no change for existing callers). Rates (USD per Mtok, peak): deepseek-flash input 0.3 output 1.2 cache_read 0.006 cache_write 0; deepseek-v4-pro input 1.32 output 3.96 cache_read 0.044 cache_write 0. 2026 CN holiday ranges (inclusive, UTC dates, all-day off-peak): Jan 1-3, Feb 15-23, Apr 4-6, May 1-5, Jun 19-21, Sep 25-27, Oct 1-7. Implement the engine INLINE in pricing.js (self-contained: no imports beyond the existing json import; no fs reads; no new deps) — mirror the proven logic in the repo's rates.ts (read it). Keep lookupPrice's signature unchanged (returns the static peak Price). Do NOT touch nativeOrComputed's behavior. Also copy the installed build/session/model-prices.json verbatim to stage/context-mode/build/session/model-prices.json. Do NOT modify anything under ~/.pi/agent/npm/node_modules — stage only. Run `node --check stage/context-mode/build/session/pricing.js`."
+    },
+    {
+      "id": "impl-tests",
+      "type": "agent",
+      "agent": "executor-code",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["impl-pricing"],
+      "context": ["tests/rates.test.ts"],
+      "idempotent": false,
+      "task": "Write tests/ctxmode-pricing.test.ts (node:test + node:assert/strict, zero deps, plain .ts like tests/rates.test.ts) importing from '../stage/context-mode/build/session/pricing.js' (ESM import; the file uses `import ... with { type: \"json\" }`). Cases: (1) computeCostUsd('deepseek-flash', t, offPeakTs) is exactly half of computeCostUsd('deepseek-flash', t, peakTs) for t with all four buckets; (2) peak window Monday 02:00Z, off-peak Wednesday 12:00Z, weekend Saturday 02:00Z, CN holiday 2026-02-16 (within Feb 15-23) 02:00Z all behave correctly vs static; (3) no ts => equals static peak (backward compat); (4) provider-prefixed id 'deepseek/deepseek-v4-pro' and legacy alias 'deepseek-v4-flash' resolve to the right tables; (5) non-deepseek model ('claude-sonnet-4-6') result is IDENTICAL to the unmodified installed pricing.js result for the same tokens with and without ts; (6) unknown model and all-zero tokens return null; (7) NaN ts behaves like no ts. To assert (5) against the pristine original, ALSO copy the installed pricing.js + model-prices.json into a fixture dir stage-fixture (e.g. stage/context-mode-pristine/) and import from there. Verify the pristine copy stays unmodified (diff against installed file). Run: `node --test tests/ctxmode-pricing.test.ts` must pass. Also run `node --test tests/rates.test.ts tests/ctxmode-pricing.test.ts tests/ds-reconcile.test.mjs` and confirm all green."
+    },
+    {
+      "id": "impl-script",
+      "type": "agent",
+      "agent": "executor-code",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["impl-tests"],
+      "context": ["docs/phase-specs/phase-3.md"],
+      "idempotent": false,
+      "task": "Write scripts/patch-ctxmode.sh (bash, set -euo pipefail, zero deps beyond node/coreutils) implementing phase-3 install policy from docs/phase-specs/phase-3.md: default mode `apply` copies stage/context-mode/build/session/pricing.js over ~/.pi/agent/npm/node_modules/context-mode/build/session/pricing.js — first making a timestamped backup pricing.js.pre-ds-pricing.<epoch>.bak when the installed file differs from staged; IDEMPOTENT: if sha256 of installed == staged, print 'ALREADY PATCHED' and exit 1 (documented convention — caller checks exit codes); if installed was modified by someone else since our backup, still back up then overwrite. Modes: `apply` (default), `check` (exit 0 + 'PATCHED' when hashes match, exit 1 + 'NOT PATCHED' when they differ, no writes), `verify` (check + a live smoke: run node -e importing the installed pricing.js and assert computeCostUsd('deepseek-flash', {input_tokens:1000000}, new Date('2026-03-04T12:00:00Z').getTime()) equals 0.15 i.e. half of peak; print VERIFY-OK or fail). Print the installed context-mode package version (node -p \"require('.../package.json').version\") in apply/check output so upgrade detection is easy. Also write scripts/probe-native-pass.mjs: zero-dep Node ESM probe that (a) imports the installed session-extract.bundle.mjs IF possible; if the bundle cannot be imported cleanly, fall back to the unminified build/session/extract.js+analytics.js pipeline and SAY SO in the output; (b) finds the most recent session file under ~/.pi/agent/sessions/**/*.jsonl (newest mtime), runs extraction over it, counts rows whose model_id starts with 'deepseek': rows WITH a numeric native_cost_usd vs rows that fell back to catalog computation; (c) writes docs/evidence/phase3-native-pass.json with {probeTime, source: 'bundle'|'build', sessionFile, totals, samples: up to 5 rows}; (d) prints a 10-line summary. Run `bash -n scripts/patch-ctxmode.sh && node --check scripts/probe-native-pass.mjs`."
+    },
+    {
+      "id": "tests-gate",
+      "type": "gate",
+      "agent": "reviewer",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["impl-script"],
+      "output": "json",
+      "eval": ["{steps.impl-script.output} contains 'SYNTAX'", "{steps.impl-script.output} contains 'OK'"],
+      "expect": {
+        "type": "object",
+        "properties": {
+          "verdict": { "enum": ["pass", "block"] },
+          "reason": { "type": "string" }
+        },
+        "required": ["verdict", "reason"]
+      },
+      "onBlock": "retry",
+      "retry": { "max": 1 },
+      "task": "Review the three phase-3 artifacts on disk: stage/context-mode/build/session/pricing.js (patched copy: engine correct vs repo rates.ts peak windows and 2026 holidays; exports/behavior preserved; no imports added; stage-only policy respected), tests/ctxmode-pricing.test.ts (covers peak/off-peak/back-compat/legacy/non-deepseek/null cases), scripts/patch-ctxmode.sh + scripts/probe-native-pass.mjs (idempotent, backups, no writes outside the two documented paths). Respond ONLY with JSON: {\"verdict\":\"pass\"|\"block\",\"reason\":\"...\"}."
+    },
+    {
+      "id": "install",
+      "type": "script",
+      "run": ["bash", "-c", "cd /home/kmanu/dev/deepseek-pricing && echo '--- first apply:' && bash scripts/patch-ctxmode.sh apply; RC=$?; echo \"first-apply-exit=$RC\"; echo '--- second apply (must say ALREADY PATCHED, exit 1):'; bash scripts/patch-ctxmode.sh apply; RC2=$?; echo \"second-apply-exit=$RC2\"; echo '--- check mode:'; bash scripts/patch-ctxmode.sh check; echo '--- verify mode:'; bash scripts/patch-ctxmode.sh verify; echo '--- full test suite:'; node --test tests/rates.test.ts tests/ctxmode-pricing.test.ts tests/ds-reconcile.test.mjs 2>&1 | tail -8"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["tests-gate"],
+      "timeout": 120000,
+      "idempotent": false
+    },
+    {
+      "id": "install-gate",
+      "type": "gate",
+      "agent": "reviewer",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["install"],
+      "output": "json",
+      "eval": [
+        "{steps.install.output} contains 'first-apply-exit=0'",
+        "{steps.install.output} contains 'ALREADY PATCHED'",
+        "{steps.install.output} contains 'second-apply-exit=1'",
+        "{steps.install.output} contains '# fail 0'"
+      ],
+      "expect": {
+        "type": "object",
+        "properties": {
+          "verdict": { "enum": ["pass", "block"] },
+          "reason": { "type": "string" }
+        },
+        "required": ["verdict", "reason"]
+      },
+      "onBlock": "retry",
+      "retry": { "max": 1 },
+      "task": "Verify the install phase output shows: first apply exit 0, second apply reported ALREADY PATCHED with exit 1, check and verify modes passed, full test suite green (# fail 0). Respond ONLY with JSON: {\"verdict\":\"pass\"|\"block\",\"reason\":\"...\"}."
+    },
+    {
+      "id": "probe",
+      "type": "script",
+      "run": ["bash", "-c", "cd /home/kmanu/dev/deepseek-pricing && node scripts/probe-native-pass.mjs; ls -la docs/evidence/phase3-native-pass.json"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["install-gate"],
+      "timeout": 120000,
+      "idempotent": false
+    },
+    {
+      "id": "docs",
+      "type": "agent",
+      "agent": "doc-writer",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["probe"],
+      "idempotent": false,
+      "task": "Update the repo docs for phase 3 completion (read the probe output in docs/evidence/phase3-native-pass.json first and cite its numbers): (1) docs/decisions.md — add D-11: 'context-mode bundle left unpatched' with the rationale (minified 4-line bundle, surgical patch too fragile across upgrades; native_cost_usd pass-through from phases 1-2 carries the common rows; pricing.js fallback patched instead; probe evidence numbers). (2) docs/research-notes.md §5 — append the verified facts: bundle is minified with inlined catalog `var O={...}`; its cost fn prefers numeric native_cost_usd; build/session/extract.js maps pi usage.cost.total -> native_cost_usd; pricing.js is unminified and importable in tests. (3) PROGRESS.md — mark Phase 3 Build/Review/Installed [x]; leave Live verification [ ] with exact manual steps: (a) user runs ctx_stats (or the ctx-stats skill) on a real session and compares DeepSeek rows to the extension ledger (~/.pi/deepseek-pricing/ledger.jsonl); (b) after any context-mode upgrade, run `bash scripts/patch-ctxmode.sh apply` (documented ALREADY PATCHED exit-1 convention). (4) Append a short note to ~/.pi/agent/AGENTS.md (device-level): after ctx-upgrade or any context-mode npm update, re-run `bash ~/dev/deepseek-pricing/scripts/patch-ctxmode.sh apply` to restore time-aware DeepSeek pricing (see ~/dev/deepseek-pricing/PROGRESS.md). Keep edits additive and terse; do not rewrite unrelated sections. Commit: 'phase 3: context-mode time-aware pricing + patch script + docs'."
+    },
+    {
+      "id": "report",
+      "type": "agent",
+      "agent": "executor",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["docs"],
+      "idempotent": false,
+      "final": true,
+      "task": "Phase 3 is implemented, installed, and documented. Do NOT re-implement. Verify on disk: stage/context-mode/build/session/pricing.js exists; installed ~/.pi/agent/npm/node_modules/context-mode/build/session/pricing.js has the same sha256 as staged (sha256sum both); scripts/patch-ctxmode.sh + scripts/probe-native-pass.mjs exist; docs/evidence/phase3-native-pass.json exists; ~/.pi/agent/AGENTS.md contains the re-patch note. Then produce a compact final report: what changed, evidence numbers from the probe, the install idempotence results, and what remains for LIVE verification by the user (ctx_stats vs ledger comparison). Do not run git commit (the docs phase already committed)."
+    }
+  ]
+}
