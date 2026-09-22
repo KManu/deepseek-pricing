@@ -120,3 +120,15 @@ starts 2026-07-27, so 2026 coverage suffices for back-calculation.
   (`~/.pi/agent/auth.json` → `deepseek.key`) returns granted/topped-up/total
   balance. Per-request prices are NOT returned by the API — billing-instant is
   client-inferred (we use the usage entry timestamp; see decisions.md).
+
+## 7. DeepSeek balance API (for ds-reconcile)
+
+- `GET https://api.deepseek.com/user/balance` — `Authorization: Bearer <key>`.
+- Response shape:
+  `{ "is_available": true, "balance_infos": [ { "currency": "CNY"|"USD",
+  "total_balance": "...", "granted_balance": "...", "topped_up_balance": "..." } ] }`
+  (numbers are strings; there may be several currency entries — prefer USD).
+- Billing deducts from granted balance first, then topped-up.
+- Top-up detection between samples: `topUp = max(0, currToppedUp - prevToppedUp)`;
+  `balanceSpend = prevTotal - currTotal + topUp`; `drift = ledgerWindowSum - balanceSpend`.
+- Key source: `~/.pi/agent/auth.json` → `deepseek.key` (file mode 0600; never log it).

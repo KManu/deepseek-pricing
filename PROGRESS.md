@@ -11,8 +11,8 @@ Runtime deploy: `~/.pi/agent/extensions/deepseek-pricing/`
 
 | Phase | Build | Review | Installed | Live verification |
 |---|---|---|---|---|
-| Phase 1 — rate engine + extension | `[x]` | `[x]` | `[x]` | `[ ]` **PENDING** |
-| Phase 2 — reconciliation + ops | `[ ]` | `[ ]` | `[ ]` | `[ ]` |
+| Phase 1 — rate engine + extension | `[x]` | `[x]` | `[x]` | `[x]` (2026-09-22, user-confirmed) |
+| Phase 2 — reconciliation + ops | `[x]` | `[x]` | `[x]` | `[ ]` |
 | Phase 3 — context-mode stats (optional) | `[ ]` | `[ ]` | `[ ]` | `[ ]` |
 
 ---
@@ -50,14 +50,14 @@ Deployed (byte-identical to repo copies, via `bash install.sh`):
 Not yet verified: the live end-to-end path through a real pi session
 (see below). This is the only open Phase 1 item.
 
-### Phase 1 — LIVE VERIFICATION (PENDING)
+### Phase 1 — LIVE VERIFICATION (`[x]` DONE 2026-09-22)
 
-Manual steps, run after the extension has been installed. Requires a **fresh pi
-session** so the extension is discovered at startup.
+User confirmed in a separate pi session: extension loads without startup
+errors and `/ds-cost` renders the session report. `/reload` in the working
+session hot-reloaded the extension successfully (docs: auto-discovered
+extensions can be hot-reloaded with `/reload`).
 
-1. **Extension discovery / no startup error.**
-   Start a new pi session (`pi` from any directory) and confirm the
-   `deepseek-pricing` extension loads without an error in pi's output/logs.
+---
    If the extension throws at load time it will be reported here; handlers
    themselves are try/catch guarded and never break a turn.
 
@@ -117,16 +117,95 @@ Record the outcome (pass/fail + observed values) in the Phase 1 section above.
 
 ## Phase 2 — Reconciliation + ops
 
-**Implemented:** `[ ]`
+**Implemented:** `[x]` (2026-09-22) · **Reviewed:** `[x]` (taskflow gates,
+`taskflow/phase2.json`) · **Installed:** `[x]`
 
-Deliverables (see `PLAN.md` / `docs/phase-specs/phase-2.md`):
-`scripts/ds-reconcile.mjs` → `~/.local/bin/ds-reconcile`, balance history at
-`~/.pi/deepseek-pricing/balance.jsonl`, drift report, optional auto-run wrapper,
-and the compaction-summary decision (D-09).
+Commits:
+- `33b5a10` feat: phase 2 ds-reconcile balance reconciliation CLI
+- `c8317a5` feat: guarded session_compact cost-probe handler (phase 2 D-09)
 
-Note: `install.sh` already tolerates a missing `scripts/ds-reconcile.mjs`
-(`|| true`), so Phase 1 installs cleanly before Phase 2 lands. No
-`ds-reconcile` binary exists yet.
+Deliverables on disk:
+- `scripts/ds-reconcile.mjs` — zero-dep Node ESM balance reconciliation CLI
+- `index.ts` — guarded `session_compact` D-09 probe handler added
+- `install.sh` — best-effort installs the CLI to `~/.local/bin/ds-reconcile`
+- `docs/research-notes.md` — §7 balance API shape + reconciliation formulas
+
+Deployed:
+- `~/.local/bin/ds-reconcile` — mode 0755, byte-identical to the repo copy
+  (installed by `bash install.sh`)
+- `~/.pi/deepseek-pricing/balance.jsonl` — balance history (3 samples so far)
+- `~/.pi/deepseek-pricing/compaction-probe.jsonl` — created on the first
+  compaction after the probe handler is loaded (not present yet)
+
+**Verification performed (2026-09-22):**
+
+| Check | Command | Result |
+|---|---|---|
+| Repo script present | `test -f scripts/ds-reconcile.mjs` | present |
+| Deployed + executable | `test -x ~/.local/bin/ds-reconcile` | executable (0755) |
+| Deploy fidelity | `diff -q` repo vs installed | identical |
+| Syntax | `node --check scripts/ds-reconcile.mjs` | OK |
+| CLI surface | `ds-reconcile --help` | `--once` / `--daemon` / `--stop` / `--help` |
+| Probe handler | grep `session_compact` in `index.ts` | registered, try/catch guarded |
+| Balance history | `wc -l ~/.pi/deepseek-pricing/balance.jsonl` | 3 sample lines |
+
+Not yet verified: the live paths — compaction-probe evidence (D-09) and the
+`ds-reconcile` drift line against a real two-sample window. See below.
+
+### Phase 2 — LIVE VERIFICATION (PENDING)
+
+Manual steps, run in a real pi session / shell. Leave the Phase 2 Live
+verification cell `[ ]` until all three are observed and recorded.
+
+**(a) D-09 compaction probe — decide whether the in-place `usage.cost`
+mutation works** (mutate vs accept overestimate).
+
+1. In a pi session, run `/reload` so the current `index.ts` (with the
+   `session_compact` probe) is hot-loaded.
+2. Run `/compact` to trigger a context compaction. The probe writes one JSON
+   line per compaction attempt.
+3. Inspect the evidence:
+   ```bash
+   cat ~/.pi/deepseek-pricing/compaction-probe.jsonl
+   ```
+4. **Decision:**
+   - If lines show `"reflectedInEntries": true`, the in-place mutation works
+     and pi keeps the time-aware summary cost → keep the mutation
+     (**D-09 = mutate**).
+   - If lines show `"reflectedInEntries": false` or `"not-found"`, pi does not
+     re-read the mutated object → accept pi's static peak-cost overestimate for
+     the summarization charge (**D-09 = accept overestimate**) and retire the
+     mutation.
+
+**(b) `ds-reconcile` drift line** (needs ≥ 2 balance samples spanning at least
+one settled ledger run).
+
+1. Run a normal pi session against a DeepSeek model until it settles, so a
+   `ledger.jsonl` line is written.
+2. Run the CLI:
+   ```bash
+   ds-reconcile
+   ```
+3. Check the report's last line:
+   ```
+   drift: <value> USD (negative: ledger under-billed vs the balance drop |
+   positive: ledger over-billed | zero: ledger matched)
+   ```
+   A small signed drift is expected (rounding, non-billed requests); a large
+   systematic drift means the rate engine or the ledger window is wrong.
+   Record the observed value in the Phase 2 summary below.
+
+**(c) Optional — long-run daemon.**
+
+```bash
+nohup ds-reconcile --daemon --interval 60 >/dev/null 2>&1 &   # background sampler
+# ... let it run across several samples ...
+ds-reconcile --stop                                            # SIGTERM + pidfile cleanup
+```
+
+Confirm `~/.pi/deepseek-pricing/ds-reconcile.pid` appears, the daemon keeps
+appending to `balance.jsonl`, `--stop` removes the pidfile, and a second
+`--daemon` start is refused while one is live.
 
 ## Phase 3 — context-mode stats accuracy (optional)
 
@@ -189,3 +268,45 @@ _(appended 2026-09-22; see also the table above)_
 Live end-to-end verification in a fresh pi session (see the Phase 1 LIVE
 VERIFICATION checklist above) — this is the only Phase 1 item not yet
 completed.
+
+---
+
+# Phase 2 — Implementation Summary
+
+_(appended 2026-09-22)_
+
+## Files created / changed
+
+| File | Purpose |
+|---|---|
+| `scripts/ds-reconcile.mjs` | Zero-dep Node ESM CLI. Reads the DeepSeek API key from `~/.pi/agent/auth.json` (`deepseek.key`, never logged), GETs `https://api.deepseek.com/user/balance`, appends a `{ts,totalBalance,grantedBalance,toppedUpBalance,currency}` sample to `~/.pi/deepseek-pricing/balance.jsonl`, and compares the balance drop between the latest two samples against the sum of `dynamicCost` in `ledger.jsonl` over the same `(prev.ts, curr.ts]` window (exclusive start avoids double-counting). Reports `drift = ledgerWindowSum - balanceSpend`, with `balanceSpend = prev.total - curr.total + max(0, curr.toppedUp - prev.toppedUp)`. Prefers the USD `balance_infos` entry; skips drift for non-USD or mixed-currency balances. Modes: `--once` (default), `--daemon [--interval <min>]`, `--stop`, `--help`. Daemon follows the AGENTS.md pidfile pattern (`~/.pi/deepseek-pricing/ds-reconcile.pid`) with SIGTERM/SIGINT cleanup and single-instance refusal. |
+| `index.ts` (changed) | Added a guarded `pi.on("session_compact", …)` D-09 probe. On compaction it locates the saved `compactionEntry`; only for DeepSeek it recomputes `usage.cost` at the entry timestamp, mutates the cost object in place, then re-reads `ctx.sessionManager.getEntries()` to see whether the mutation is reflected. It appends the outcome (`recomputedTotal`, `objectTotalAfterMutation`, `reflectedInEntries`) to `~/.pi/deepseek-pricing/compaction-probe.jsonl`. Evidence-only and fully try/catch guarded — it never changes pi behaviour and never throws into pi. |
+| `install.sh` (changed) | Best-effort installs `scripts/ds-reconcile.mjs` to `~/.local/bin/ds-reconcile` and `chmod +x`. |
+| `docs/research-notes.md` | §7: DeepSeek balance API shape + reconciliation formulas. |
+
+## What Phase 2 adds at runtime
+
+- **Balance ground truth.** `ds-reconcile` samples the account balance so the
+  dynamic time-aware pricing can be validated against reality rather than only
+  against pi's static-peak estimate.
+- **Drift report.** Per sample: availability, currency, total / granted /
+  topped-up, the top-up-adjusted balance spend over the window and the ledger
+  window sum, ending in a signed `drift` line.
+- **D-09 evidence.** The compaction probe turns the open "does pi keep the
+  patched compaction cost?" question into a recorded, decidable fact.
+
+## Verification performed
+
+- `scripts/ds-reconcile.mjs` present; byte-identical to the installed,
+  executable `~/.local/bin/ds-reconcile` (0755).
+- `node --check scripts/ds-reconcile.mjs` → OK; `ds-reconcile --help` lists the
+  `--once` / `--daemon` / `--stop` / `--help` surface.
+- `index.ts` registers the guarded `session_compact` probe handler.
+- `~/.pi/deepseek-pricing/balance.jsonl` has 3 well-formed sample lines.
+- Phase 2 flow gates tracked in `taskflow/phase2.json`.
+
+## Still open
+
+Live verification only (see "Phase 2 — LIVE VERIFICATION (PENDING)" above):
+(a) decide D-09 from `compaction-probe.jsonl` after `/reload` + `/compact`,
+(b) read the `ds-reconcile` drift line, (c) optionally long-run `--daemon`.

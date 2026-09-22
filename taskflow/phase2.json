@@ -1,0 +1,122 @@
+{
+  "name": "ds-pricing-phase2",
+  "description": "Phase 2: ds-reconcile balance reconciliation CLI + compaction-cost probe handler, reviewed via gates, then install.",
+  "strictInterpolation": true,
+  "budget": { "maxUSD": 1.5 },
+  "phases": [
+    {
+      "id": "specs-ok",
+      "type": "script",
+      "run": ["bash", "-c", "test -f docs/phase-specs/phase-2.md && test -f docs/phase-specs/phase-1.md && test -f docs/research-notes.md && echo SPECS-OK"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing"
+    },
+    {
+      "id": "reconcile",
+      "type": "agent",
+      "agent": "executor",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["specs-ok"],
+      "context": ["docs/phase-specs/phase-2.md", "docs/research-notes.md"],
+      "idempotent": false,
+      "task": "Implement scripts/ds-reconcile.mjs exactly per docs/phase-specs/phase-2.md section 1 (read it fully) using the balance-API facts in docs/research-notes.md section 7. Zero-dep Node ESM. Requirements: reads key from ~/.pi/agent/auth.json (deepseek.key; never print it), GET /user/balance, appends balance.jsonl sample, prints balances + spend-since-previous + ledger-window sum + drift (handle empty/absent ledger gracefully), --once (default) / --daemon with --interval <min> (float allowed) / --stop / --help; daemon writes pidfile at ~/.pi/deepseek-pricing/ds-reconcile.pid, traps SIGTERM/SIGINT to remove it, refuses to start if a live pidfile exists. Also update install.sh so ds-reconcile is deployed to ~/.local/bin/ds-reconcile with chmod +x (keep the || true safety). Do NOT run the live API call (a later phase does)."
+    },
+    {
+      "id": "cli-syntax",
+      "type": "script",
+      "run": ["bash", "-c", "node --check scripts/ds-reconcile.mjs && node scripts/ds-reconcile.mjs --help && bash -n install.sh && echo SYNTAX-OK"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["reconcile"]
+    },
+    {
+      "id": "live-once",
+      "type": "script",
+      "run": ["bash", "-c", "node scripts/ds-reconcile.mjs --once"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["cli-syntax"],
+      "idempotent": false,
+      "timeout": 60000,
+      "optional": true
+    },
+    {
+      "id": "reconcile-gate",
+      "type": "gate",
+      "agent": "reviewer",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["live-once"],
+      "output": "json",
+      "eval": [
+        "{steps.cli-syntax.output} contains SYNTAX-OK",
+        "{steps.live-once.output} contains drift"
+      ],
+      "expect": {
+        "type": "object",
+        "properties": {
+          "verdict": { "enum": ["pass", "block"] },
+          "reason": { "type": "string" }
+        },
+        "required": ["verdict", "reason"]
+      },
+      "onBlock": "retry",
+      "retry": { "max": 2 },
+      "task": "Review scripts/ds-reconcile.mjs on disk against docs/phase-specs/phase-2.md and docs/research-notes.md section 7. Check: key read path and non-leakage, balance endpoint usage, top-up detection math (spend = prevTotal - currTotal + topUp), ledger window sum vs drift, pidfile lifecycle in daemon mode, graceful handling of empty ledger and API errors, zero deps. NOTE: if the live --once run failed due to network (its output may be empty), review statically and say so in the reason. Respond ONLY with JSON: {\"verdict\":\"pass\"|\"block\",\"reason\":\"...\"}."
+    },
+    {
+      "id": "probe",
+      "type": "agent",
+      "agent": "executor",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["reconcile-gate"],
+      "context": ["docs/phase-specs/phase-2.md", "docs/phase-specs/phase-1.md", "docs/extension-api-cheat.md"],
+      "idempotent": false,
+      "task": "Add a guarded session_compact probe handler to index.ts per docs/phase-specs/phase-2.md section 2. It must: (1) on session_compact, if event.compactionEntry has a numeric usage with a cost object and a timestamp, recompute cost via computeCost for the deepseek model (entry provider/model fields), mutate event.compactionEntry.usage.cost in place; (2) then re-read ctx.sessionManager.getEntries() and locate the compaction entry; (3) append one evidence line to ~/.pi/deepseek-pricing/compaction-probe.jsonl: {ts, sessionId, model, recomputedTotal, objectTotalAfterMutation, reflectedInEntries: boolean|'not-found', note}; (4) everything in try/catch, never throw; (5) do NOT alter any existing handler or the ledger/report logic. Then run `node --check index.ts` and `node --test tests/` to confirm nothing regressed."
+    },
+    {
+      "id": "probe-checks",
+      "type": "script",
+      "run": ["bash", "-c", "node --check index.ts && node --test tests/ 2>&1 | tail -8 && bash install.sh"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["probe"]
+    },
+    {
+      "id": "probe-gate",
+      "type": "gate",
+      "agent": "reviewer",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["probe-checks"],
+      "output": "json",
+      "eval": [
+        "{steps.probe-checks.output} contains '# fail 0'",
+        "{steps.probe-checks.output} contains installed"
+      ],
+      "expect": {
+        "type": "object",
+        "properties": {
+          "verdict": { "enum": ["pass", "block"] },
+          "reason": { "type": "string" }
+        },
+        "required": ["verdict", "reason"]
+      },
+      "onBlock": "retry",
+      "retry": { "max": 2 },
+      "task": "Review the session_compact probe handler in index.ts against docs/phase-specs/phase-2.md section 2. Check: existing handlers unchanged in behavior (message_end/tool_result/agent_settled/ds-cost), probe is fully guarded and cannot throw into pi, evidence line schema matches spec, mutation only touches deepseek compaction entries, tests still green. Respond ONLY with JSON: {\"verdict\":\"pass\"|\"block\",\"reason\":\"...\"}."
+    },
+    {
+      "id": "daemon-test",
+      "type": "script",
+      "run": ["bash", "-c", "node scripts/ds-reconcile.mjs --daemon --interval 0.05 >/dev/null 2>&1 & sleep 5; if [ ! -f ~/.pi/deepseek-pricing/ds-reconcile.pid ]; then echo DAEMON-FAIL-NO-PID; exit 1; fi; kill $(cat ~/.pi/deepseek-pricing/ds-reconcile.pid); sleep 2; if [ -f ~/.pi/deepseek-pricing/ds-reconcile.pid ]; then echo DAEMON-FAIL-PID-LEFT; exit 1; else echo DAEMON-OK; fi"],
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["probe-gate"],
+      "timeout": 30000
+    },
+    {
+      "id": "report",
+      "type": "agent",
+      "agent": "executor",
+      "cwd": "/home/kmanu/dev/deepseek-pricing",
+      "dependsOn": ["daemon-test"],
+      "idempotent": false,
+      "final": true,
+      "task": "Phase 2 implementation is complete and deployed. Do NOT re-implement anything. 1) Verify on disk: scripts/ds-reconcile.mjs exists, ~/.local/bin/ds-reconcile exists and is executable, index.ts contains the probe handler, ~/.pi/deepseek-pricing/balance.jsonl has at least one sample line. 2) Update PROGRESS.md: mark Phase 2 Build/Review/Installed as [x]; leave Live verification [ ] and add a 'Phase 2 — LIVE VERIFICATION (PENDING)' section with exact manual steps: (a) user runs /reload, then /compact in a session and we inspect ~/.pi/deepseek-pricing/compaction-probe.jsonl to decide D-09 (mutate works or accept overestimate); (b) user runs `ds-reconcile` and checks the drift line; (c) optional: `ds-reconcile --daemon` long-run. 3) Append a phase-2 summary. 4) Commit with message 'phase 2: ds-reconcile + compaction probe'."
+    }
+  ]
+}
