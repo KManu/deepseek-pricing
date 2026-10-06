@@ -1,0 +1,14 @@
+{
+  "name": "deepseek-pricing",
+  "version": "1.0.0",
+  "description": "pi extension: time-aware DeepSeek pricing (peak/off-peak rate card, CN holidays, cost reconciliation)",
+  "keywords": ["pi-package", "pi-extension", "deepseek", "pricing", "cost-tracking"],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
