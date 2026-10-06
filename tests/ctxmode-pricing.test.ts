@@ -230,13 +230,18 @@ test(
     for (const file of ["pricing.js", "model-prices.json"]) {
       // pricing.js: compare against the newest pre-patch backup once the patch
       // has been applied, otherwise against the still-unmodified installed file.
-      // model-prices.json is never patched, so it always compares to installed.
+      // model-prices.json: the patch merges staged rows into the installed
+      // file, so it always compares to installed — and doubles as a drift
+      // detector after a context-mode upgrade.
       const referencePath =
         file === "pricing.js" && backup ? backup : join(INSTALLED_DIR, file);
       const reference = readFileSync(referencePath);
       const fixture = readFileSync(new URL(file, fixtureDir));
+      // Content-equal, line-ending-normalized: core.autocrlf checks the
+      // fixture out as CRLF on Windows while the installed files ship LF.
+      const normalize = (b: Buffer) => b.toString("utf8").replace(/\r\n/g, "\n");
       assert.ok(
-        reference.equals(fixture),
+        normalize(reference) === normalize(fixture),
         `stage/context-mode-pristine/${file} differs from ${
           file === "pricing.js" && backup ? backup : "the installed file"
         }`,

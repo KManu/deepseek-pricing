@@ -6,25 +6,29 @@
 # context-mode ships a static per-model price catalog. For the two time-aware
 # DeepSeek billing keys the effective rate depends on the request wall-clock
 # (peak / off-peak). The staged module in this repo duplicates the tiny pure-UTC
-# engine inline; this script copies it over the installed module. Every
+# engine inline; this script copies it over the installed module. The staged
+# catalog ships the DeepSeek rows the patched module resolves through
+# (model-prices.json); those rows are merged into the installed catalog
+# ADD-ONLY — existing rows (upstream values included) are never overwritten or
+# removed, so catalog refreshes in newer context-mode releases survive. Every
 # context-mode upgrade (or `ctx-upgrade`) wipes the patch — re-run this script.
 #
 # Usage: scripts/patch-ctxmode.sh [apply|check|verify]
 #
-#   apply   (default) copy the staged pricing.js over the installed one. The
-#           previous installed file is backed up first (only when it differs
-#           from staged) as
-#             <installed>.pre-ds-pricing.<epoch>.bak
-#           and the installed context-mode package version is printed. If the
-#           installed file already hashes identically to staged the script is a
-#           no-op and prints "ALREADY PATCHED" with exit 1 — this is the
-#           documented idempotence convention, so callers MUST inspect the exit
-#           code rather than treating non-zero as an outright failure.
-#           Exit 0 = a fresh patch was applied.
+#   apply   (default) deploy the staged pricing.js and the staged catalog rows.
+#           Every file that gets replaced is backed up first (only when it
+#           differs) as <file>.pre-ds-pricing.<epoch>.bak, and the installed
+#           context-mode package version is printed. When both components are
+#           already up to date the script is a no-op and prints
+#           "ALREADY PATCHED" with exit 1 — this is the documented idempotence
+#           convention, so callers MUST inspect the exit code rather than
+#           treating non-zero as an outright failure.
+#           Exit 0 = at least one fresh deployment was made.
 #
-#   check   No writes. Prints the installed package version and:
-#             "PATCHED"     + exit 0 when installed sha256 == staged sha256
-#             "NOT PATCHED" + exit 1 when they differ
+#   check   No writes. Prints the installed package version and per-component
+#           status, then:
+#             "PATCHED"     + exit 0 when BOTH components are up to date
+#             "NOT PATCHED" + exit 1 when either component differs
 #
 #   verify  check + a live smoke test: imports the installed module and asserts
 #           computeCostUsd('deepseek-flash', { input_tokens: 1_000_000 },
@@ -39,9 +43,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGED="$REPO_ROOT/stage/context-mode/build/session/pricing.js"
+STAGED_CATALOG="$REPO_ROOT/stage/context-mode/build/session/model-prices.json"
 
 CTXMODE_DIR="${CTXMODE_DIR:-$HOME/.pi/agent/npm/node_modules/context-mode}"
 INSTALLED="$CTXMODE_DIR/build/session/pricing.js"
+INSTALLED_CATALOG="$CTXMODE_DIR/build/session/model-prices.json"
 PKG_JSON="$CTXMODE_DIR/package.json"
 
 MODE="${1:-apply}"
@@ -58,6 +64,33 @@ package_version() {
     else
         printf 'unknown\n'
     fi
+}
+
+# --- catalog merge -----------------------------------------------------------
+# The patched pricing.js resolves DeepSeek ids through the curated catalog, so
+# the staged DeepSeek rows must exist in the installed model-prices.json.
+# Add-only: staged rows missing from installed are appended; existing rows are
+# never touched (upstream price refreshes in newer context-mode releases win).
+
+catalog_missing_count() { # → number of staged keys absent from the installed catalog
+    node -e 'const fs = require("fs");
+const inst = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+const staged = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+let missing = 0;
+for (const k of Object.keys(staged)) if (!(k in inst)) missing++;
+console.log(missing);' "$INSTALLED_CATALOG" "$STAGED_CATALOG"
+}
+
+catalog_deploy() { # → merged catalog written in place; prints rows added
+    node -e 'const fs = require("fs");
+const inst = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+const staged = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+let added = 0;
+for (const k of Object.keys(staged)) {
+    if (!(k in inst)) { inst[k] = staged[k]; added++; }
+}
+fs.writeFileSync(process.argv[3], JSON.stringify(inst, null, 2) + "\n");
+console.log(added);' "$INSTALLED_CATALOG" "$STAGED_CATALOG" "$INSTALLED_CATALOG"
 }
 
 # The live smoke: the installed module must bill the 2026-03-04 12:00Z instant
@@ -84,6 +117,8 @@ console.log("VERIFY-OK");'
 
 [ -f "$STAGED" ] || die "staged pricing.js not found: $STAGED"
 [ -f "$INSTALLED" ] || die "installed pricing.js not found: $INSTALLED"
+[ -f "$STAGED_CATALOG" ] || die "staged model-prices.json not found: $STAGED_CATALOG"
+[ -f "$INSTALLED_CATALOG" ] || die "installed model-prices.json not found: $INSTALLED_CATALOG"
 
 STAGED_SHA="$(sha "$STAGED")"
 INSTALLED_SHA="$(sha "$INSTALLED")"
@@ -91,19 +126,36 @@ INSTALLED_SHA="$(sha "$INSTALLED")"
 case "$MODE" in
     apply)
         printf 'context-mode version: %s\n' "$(package_version)"
+        DEPLOYED=0
         printf 'staged pricing.js    sha256 %s\n' "$STAGED_SHA"
         printf 'installed pricing.js sha256 %s\n' "$INSTALLED_SHA"
         if [ "$STAGED_SHA" = "$INSTALLED_SHA" ]; then
+            printf 'pricing.js: already patched\n'
+        else
+            # Always back up the live file before overwriting it. "Modified by
+            # someone else since our last backup" just means this backup
+            # captures that other edit — it is never skipped.
+            BACKUP="$INSTALLED.pre-ds-pricing.$(date +%s).bak"
+            cp -p "$INSTALLED" "$BACKUP"
+            printf 'pricing.js: backup %s\n' "$BACKUP"
+            cp "$STAGED" "$INSTALLED"
+            printf 'pricing.js: patched\n'
+            DEPLOYED=1
+        fi
+        CAT_MISSING="$(catalog_missing_count)"
+        if [ "$CAT_MISSING" = "0" ]; then
+            printf 'model-prices.json: all staged rows present\n'
+        else
+            BACKUP="$INSTALLED_CATALOG.pre-ds-pricing.$(date +%s).bak"
+            cp -p "$INSTALLED_CATALOG" "$BACKUP"
+            printf 'model-prices.json: %s staged row(s) missing, backup %s\n' "$CAT_MISSING" "$BACKUP"
+            printf 'model-prices.json: added %s row(s)\n' "$(catalog_deploy)"
+            DEPLOYED=1
+        fi
+        if [ "$DEPLOYED" = "0" ]; then
             printf 'ALREADY PATCHED\n'
             exit 1
         fi
-        # Always back up the live file before overwriting it. "Modified by
-        # someone else since our last backup" just means this backup captures
-        # that other edit — it is never skipped.
-        BACKUP="$INSTALLED.pre-ds-pricing.$(date +%s).bak"
-        cp -p "$INSTALLED" "$BACKUP"
-        printf 'backup: %s\n' "$BACKUP"
-        cp "$STAGED" "$INSTALLED"
         printf 'PATCHED\n'
         ;;
 
@@ -111,7 +163,21 @@ case "$MODE" in
         printf 'context-mode version: %s\n' "$(package_version)"
         printf 'staged pricing.js    sha256 %s\n' "$STAGED_SHA"
         printf 'installed pricing.js sha256 %s\n' "$INSTALLED_SHA"
+        OK=1
         if [ "$STAGED_SHA" = "$INSTALLED_SHA" ]; then
+            printf 'pricing.js: PATCHED\n'
+        else
+            printf 'pricing.js: NOT PATCHED\n'
+            OK=0
+        fi
+        CAT_MISSING="$(catalog_missing_count)"
+        if [ "$CAT_MISSING" = "0" ]; then
+            printf 'model-prices.json: PATCHED (all staged rows present)\n'
+        else
+            printf 'model-prices.json: NOT PATCHED (%s staged row(s) missing)\n' "$CAT_MISSING"
+            OK=0
+        fi
+        if [ "$OK" = "1" ]; then
             printf 'PATCHED\n'
             exit 0
         fi
@@ -124,6 +190,13 @@ case "$MODE" in
         printf 'staged pricing.js    sha256 %s\n' "$STAGED_SHA"
         printf 'installed pricing.js sha256 %s\n' "$INSTALLED_SHA"
         if [ "$STAGED_SHA" != "$INSTALLED_SHA" ]; then
+            printf 'pricing.js: NOT PATCHED\n'
+            printf 'NOT PATCHED\n'
+            exit 1
+        fi
+        CAT_MISSING="$(catalog_missing_count)"
+        if [ "$CAT_MISSING" != "0" ]; then
+            printf 'model-prices.json: NOT PATCHED (%s staged row(s) missing)\n' "$CAT_MISSING"
             printf 'NOT PATCHED\n'
             exit 1
         fi
@@ -133,8 +206,8 @@ case "$MODE" in
 
     -h|--help|help)
         printf 'usage: %s [apply|check|verify]\n' "$(basename "$0")"
-        printf '  apply (default)  install the staged pricing.js (idempotent)\n'
-        printf '  check            report PATCHED/NOT PATCHED, no writes\n'
+        printf '  apply (default)  deploy staged pricing.js + staged catalog rows (idempotent)\n'
+        printf '  check            report PATCHED/NOT PATCHED per component, no writes\n'
         printf '  verify           check + live computeCostUsd smoke test\n'
         ;;
 

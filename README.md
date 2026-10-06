@@ -68,7 +68,7 @@ bash install.sh
 
 ## One-time machine-local step: context-mode patch (optional)
 
-Only needed if you have **context-mode** installed and want its `ctx_stats` output to be time-accurate. The patch replaces the installed context-mode's unminified `build/session/pricing.js` with a self-contained time-aware engine (a timestamped `.pre-ds-pricing` backup is kept). The minified hook bundle is deliberately left unpatched — it already prefers the numeric `native_cost_usd` that this extension makes time-aware.
+Only needed if you have **context-mode** installed and want its `ctx_stats` output to be time-accurate. The patch replaces the installed context-mode's unminified `build/session/pricing.js` with a self-contained time-aware engine, and merges the staged DeepSeek rows into its `build/session/model-prices.json` (add-only — existing rows are never overwritten). A timestamped `.pre-ds-pricing` backup is kept for every file that gets replaced. The minified hook bundle is deliberately left unpatched — it already prefers the numeric `native_cost_usd` that this extension makes time-aware.
 
 From a repo checkout:
 
@@ -78,7 +78,7 @@ bash scripts/patch-ctxmode.sh check    # read-only: reports PATCHED / NOT PATCHE
 bash scripts/patch-ctxmode.sh verify   # check + live smoke test of computeCostUsd
 ```
 
-Exit-code convention: `apply` exits **1** with `ALREADY PATCHED` when the installed file already matches the staged patch. That is success, not failure — inspect the output, not the exit code. Exit 0 means a fresh patch was applied.
+Exit-code convention: `apply` exits **1** with `ALREADY PATCHED` when both components already match. That is success, not failure — inspect the output, not the exit code. Exit 0 means at least one fresh deployment was made.
 
 **Re-run after every context-mode upgrade** — every `ctx-upgrade`, context-mode upgrade, or npm update wipes the patch. Forgetting this silently reverts `ctx_stats` to static peak rates (the pi extension itself is unaffected). A device-local note in `~/.pi/agent/AGENTS.md` enforces this.
 
